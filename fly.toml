@@ -1,0 +1,21 @@
+# Change "app" to something globally unique on Fly.io - app names are shared across all users.
+app = "your-binance-latency-probe"
+primary_region = "nrt"  # Tokyo
+
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[build]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[env]
+  BINANCE_SYMBOL = "BTCUSDT"
+  POLL_INTERVAL_SECONDS = "1"
+  STATS_EVERY_N_SAMPLES = "60"
+
+# Intentionally no [http_service] / [[services]] section.
+# Machines without a service definition are not auto-stopped or scaled to
+# zero - they just keep running the CMD from the Dockerfile.
