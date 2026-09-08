@@ -1,28 +1,27 @@
 # fly.toml app configuration file generated for binance-latency-probe on 2026-09-08T21:09:29Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
 
 app = 'binance-latency-probe'
 primary_region = 'nrt'
+
 kill_signal = 'SIGINT'
 kill_timeout = '5s'
 
 [build]
 
 [env]
-  BINANCE_SYMBOL = 'BTCUSDT'
-  POLL_INTERVAL_SECONDS = '1'
+  BINANCE_SYMBOL = 'btcusdt'
+  STREAM = 'bookTicker'
+  PING_INTERVAL_SECONDS = '1'
   STATS_EVERY_N_SAMPLES = '60'
-
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
 
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '256mb'
+
+# Intentionally no [http_service] block. The flyctl-generated version had one
+# with min_machines_running = 0 / auto_stop_machines = 'stop', which treats
+# the app as an idle web service and stops/restarts the machine when nothing
+# connects to internal_port 8080 - but this script never opens that port.
+# Removing it lets the machine run continuously as a plain background process.
