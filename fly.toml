@@ -1,21 +1,28 @@
-# Change "app" to something globally unique on Fly.io - app names are shared across all users.
-app = "your-binance-latency-probe"
-primary_region = "nrt"  # Tokyo
+# fly.toml app configuration file generated for binance-latency-probe on 2026-09-08T21:09:29Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-kill_signal = "SIGINT"
-kill_timeout = 5
+app = 'binance-latency-probe'
+primary_region = 'nrt'
+kill_signal = 'SIGINT'
+kill_timeout = '5s'
 
 [build]
 
-[[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
-
 [env]
-  BINANCE_SYMBOL = "BTCUSDT"
-  POLL_INTERVAL_SECONDS = "1"
-  STATS_EVERY_N_SAMPLES = "60"
+  BINANCE_SYMBOL = 'BTCUSDT'
+  POLL_INTERVAL_SECONDS = '1'
+  STATS_EVERY_N_SAMPLES = '60'
 
-# Intentionally no [http_service] / [[services]] section.
-# Machines without a service definition are not auto-stopped or scaled to
-# zero - they just keep running the CMD from the Dockerfile.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
