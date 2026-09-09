@@ -1,48 +1,59 @@
 #!/usr/bin/env python3
 """
-Binance WebSocket Latency Monitor
------------------------------------
-Opens ONE persistent WebSocket connection to Binance's public market
-data stream, then measures round-trip latency using WebSocket
-ping/pong control frames sent over that already-established connection.
+Binance WebSocket Latency Probe - Optimized
+---------------------------------------------
+Minimizes Python/asyncio-side overhead so the measured number reflects
+genuine network + Binance server-side RTT, not artifacts of garbage
+collection pauses, logging I/O, or event-loop contention.
 
-This avoids the problem with REST polling: a fresh TCP + TLS handshake
-on every single request. Here the handshake happens once, and every
-subsequent ping/pong is just a few bytes over a warm connection - so
-the numbers reflect steady-state network RTT, not connection setup cost.
+Realistic expectations: even fully optimized and same-region on AWS,
+expect roughly high-hundreds-of-microseconds to low-single-digit
+milliseconds at best - not nanoseconds. Nanosecond round trips only
+exist for same-machine shared memory or specialized hardware
+(FPGA-to-FPGA), never for two separate parties' servers over any
+IP network, however physically close.
 
-Requires: websockets (pip install websockets)
+Requires: websockets (required), uvloop (optional but recommended)
+  pip install websockets uvloop
 
-Configure via environment variables (all optional):
-  BINANCE_SYMBOL          e.g. btcusdt (default: btcusdt)
-  STREAM                  stream type: bookTicker, trade, aggTrade (default: bookTicker)
-  PING_INTERVAL_SECONDS   seconds between latency pings (default: 1)
-  STATS_EVERY_N_SAMPLES   print a stats summary every N samples (default: 60)
-  PING_TIMEOUT_SECONDS    max wait for a pong before counting as error (default: 5)
+Configure via environment variables:
+  BINANCE_SYMBOL          default: btcusdt
+  STREAM                  default: ticker (low-frequency stream -> less
+                           event-loop contention than bookTicker)
+  PING_INTERVAL_SECONDS   default: 0.2
+  STATS_EVERY_N_SAMPLES   default: 200
+  PING_TIMEOUT_SECONDS    default: 5
 """
 
 import os
+import gc
+import socket
 import asyncio
 import time
-import json
 import statistics
 from collections import deque
 from datetime import datetime, timezone
 
 import websockets
 
+try:
+    import uvloop
+    uvloop.install()
+    EVENT_LOOP = "uvloop"
+except ImportError:
+    EVENT_LOOP = "asyncio default (install uvloop for lower overhead)"
+
 SYMBOL = os.environ.get("BINANCE_SYMBOL", "btcusdt").lower()
-STREAM = os.environ.get("STREAM", "bookTicker")
-PING_INTERVAL = float(os.environ.get("PING_INTERVAL_SECONDS", "1"))
-STATS_EVERY = int(os.environ.get("STATS_EVERY_N_SAMPLES", "60"))
+STREAM = os.environ.get("STREAM", "ticker")
+PING_INTERVAL = float(os.environ.get("PING_INTERVAL_SECONDS", "0.2"))
+STATS_EVERY = int(os.environ.get("STATS_EVERY_N_SAMPLES", "200"))
 PING_TIMEOUT = float(os.environ.get("PING_TIMEOUT_SECONDS", "5"))
 
 URL = f"wss://stream.binance.com:9443/ws/{SYMBOL}@{STREAM}"
 
-recent_latencies = deque(maxlen=max(STATS_EVERY, 1))
+recent_latencies_us = deque(maxlen=max(STATS_EVERY, 1))
 total_pings = 0
 error_count = 0
-last_price_log = 0.0
 
 
 def now():
@@ -50,74 +61,81 @@ def now():
 
 
 def print_stats():
-    if not recent_latencies:
+    if not recent_latencies_us:
         return
-    data = sorted(recent_latencies)
+    data = sorted(recent_latencies_us)
     n = len(data)
     avg = statistics.mean(data)
     p50 = data[int(n * 0.50)]
     p95 = data[min(int(n * 0.95), n - 1)]
     p99 = data[min(int(n * 0.99), n - 1)]
     print(
-        f"[{now()}] STATS  n={n}  min={data[0]:.1f}ms  avg={avg:.1f}ms  "
-        f"p50={p50:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms  max={data[-1]:.1f}ms  "
-        f"errors={error_count}/{total_pings}",
+        f"[{now()}] STATS  n={n}  min={data[0]:.0f}us  avg={avg:.0f}us  "
+        f"p50={p50:.0f}us  p95={p95:.0f}us  p99={p99:.0f}us  max={data[-1]:.0f}us  "
+        f"errors={error_count}/{total_pings}  loop={EVENT_LOOP}",
         flush=True,
     )
 
 
-async def read_messages(ws):
-    """Drain incoming stream messages in the background and log a price sample occasionally."""
-    global last_price_log
-    async for message in ws:
-        try:
-            data = json.loads(message)
-        except ValueError:
-            continue
-        bid, ask = data.get("b"), data.get("a")
-        if bid and ask:
-            ts = time.time()
-            if ts - last_price_log >= 5:  # throttle: log a price line every ~5s, not every tick
-                print(f"[{now()}] {SYMBOL.upper()} bid={bid} ask={ask}", flush=True)
-                last_price_log = ts
+async def drain(ws):
+    """Consume incoming frames without parsing them. We no longer need the
+    payload, just an open connection to ping against - so skip JSON decoding
+    and printing entirely to keep the event loop as free as possible."""
+    async for _ in ws:
+        pass
 
 
 async def ping_loop(ws):
-    """Send WS ping frames on the existing connection and time the pong (steady-state RTT)."""
     global total_pings, error_count
     while True:
         await asyncio.sleep(PING_INTERVAL)
         total_pings += 1
-        start = time.perf_counter()
+        start_ns = time.perf_counter_ns()
         try:
             pong_waiter = await ws.ping()
             await asyncio.wait_for(pong_waiter, timeout=PING_TIMEOUT)
-            latency_ms = (time.perf_counter() - start) * 1000
-            recent_latencies.append(latency_ms)
-            print(f"[{now()}] ping latency={latency_ms:.1f}ms", flush=True)
-        except Exception as exc:
+            latency_us = (time.perf_counter_ns() - start_ns) / 1000
+            recent_latencies_us.append(latency_us)
+        except Exception:
             error_count += 1
-            print(f"[{now()}] ERROR on ping: {exc}", flush=True)
 
         if total_pings % STATS_EVERY == 0:
             print_stats()
 
 
+def tune_socket(ws):
+    """Explicitly disable Nagle's algorithm - small control frames should be
+    sent immediately, not batched by the kernel waiting for more data."""
+    try:
+        sock = ws.transport.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
+
+def pin_to_core():
+    """Best-effort: pin this process to one CPU core to reduce context-switch
+    and cache-migration jitter. Linux only; safe no-op elsewhere."""
+    try:
+        os.sched_setaffinity(0, {0})
+    except (AttributeError, OSError):
+        pass
+
+
 async def main():
-    print(f"[{now()}] Connecting to {URL}", flush=True)
+    pin_to_core()
+    gc.disable()  # avoid GC pauses injecting latency spikes into ping timing
+
+    print(f"[{now()}] Connecting to {URL}  (event loop: {EVENT_LOOP})", flush=True)
     backoff = 1
     while True:
         try:
-            # ping_interval=None: we drive pings ourselves for accurate timing
-            # instead of letting the library send them on its own schedule.
             async with websockets.connect(URL, ping_interval=None) as ws:
-                print(
-                    f"[{now()}] Connected. Measuring ping RTT every {PING_INTERVAL}s, "
-                    f"stats every {STATS_EVERY} samples.",
-                    flush=True,
-                )
+                tune_socket(ws)
+                print(f"[{now()}] Connected. Pinging every {PING_INTERVAL}s.", flush=True)
                 backoff = 1
-                await asyncio.gather(read_messages(ws), ping_loop(ws))
+                await asyncio.gather(drain(ws), ping_loop(ws))
         except (websockets.exceptions.ConnectionClosed, OSError) as exc:
             print(f"[{now()}] Connection lost: {exc}. Reconnecting in {backoff}s...", flush=True)
             await asyncio.sleep(backoff)
